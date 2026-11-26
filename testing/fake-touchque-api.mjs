@@ -52,6 +52,38 @@
 // Help desk: /assist* keeps sessions in memory; the person's phone answers a
 // check on POST /__test/assist {requestId?, action: approve|wrong_number|not_me|coached|decline}.
 //
+// Risk-fit contract (every new field is recorded in /__test/calls as sent):
+// - POST /login/request takes deviceRiskRequestId ('' included), parentCorrelationId and
+//   passkeyCapable, and answers riskLevel (GET /login/status repeats it). A parentCorrelationId is
+//   kept only when it is one this fake answered for the same user in the last 10 minutes (POST
+//   /risk/check, a passkey step-up); otherwise it is ignored, as the API does for a partner.
+//   requestedBy is 400 requested_by_not_allowed (this fake is a partner's workspace), riskPolicy is
+//   ignored. GET /__test/requests lists each request's riskLevel, deviceRiskRequestId,
+//   parentCorrelationId and passkeyCapable.
+// - POST /risk/check answers correlationId on every answer.
+// - POST /offline/challenge and /offline/totp/verify take the page's evidence (deviceRiskRequestId,
+//   deviceRisk, clientSignals, securityChanges, context) and answer caseCode, reasons and riskLevel.
+// - POST /webauthn/authenticate/primary/options and /verify: passkey sign-in without the ceremony.
+//   An attempt is used once; the passkey (`response.id`) must be one registered with
+//   POST /__test/passkey {user, credentialId?} (default credential id `cred-<user>`), for the
+//   attempt's user when it names one. Success makes a CONFIRMED request (confirmedVia
+//   WEBAUTHN_PRIMARY); opts passkeyStepUp answers requiresStepUp with a parked correlationId.
+// - POST /recovery/start takes the page's evidence and answers caseCode and riskLevel.
+// - Device risk answers carry visitor.mark: opts deviceMark 'trusted' | 'step_up' sets the
+//   admin's mark (visitor.status); step_up always applies, trusted only on a key or sid match.
+// - Opts: riskLevel (default 'low', 'medium' with numberMatch); riskUnavailable (503
+//   risk_unavailable, retryAfter 30, on the push, the offline QR and code, passkey sign-in and
+//   recovery; the silent check asks with checks_incomplete); phoneNotAttested (403 on the offline
+//   QR, code and packs); passkeyRequired 'action' | 'risk' (403 { code: 'passkey_required', reason }
+//   on the offline QR; the code answers reason 'passkey_required' with blockedBy, as the API does; 'risk' only when the call says passkeyCapable: true, otherwise the
+//   QR keeps its number with reason passkey_unavailable and the code goes through, as the API does
+//   under assurance enforce); actionDeny (403 { code: 'blocked', reason: 'action' } on the push,
+//   the offline QR, passkey sign-in and recovery; the code answers { reason: 'blocked', blockedBy:
+//   'action', action }); riskPasskey (the risk check asks for a
+//   phishing-resistant approval under assurance enforce: a push sent with passkeyCapable: true for a
+//   user with a passkey from /__test/passkey waits for the passkey, requiresPasskey with reason
+//   engine_passkey; any other push keeps number matching with reason passkey_unavailable).
+// - Offline QR and code record passkeyCapable as sent (/__test/calls).
 // 2FA setup context: POST /auth/generate-secret and /auth/secret/reset keep the browser
 // the partner named (clientIp, userAgent) with the new secret; POST /auth/secret/validate
 // {secret} (public, as on the API) answers it as `setupContext` (GeoIP: a fixed table of two
@@ -78,6 +110,7 @@ function reset() {
     orgAgents: new Map(), orgAgentTokens: new Map(), cibaRequests: new Map(), sharedAsks: new Map(), vaultConnections: new Map(), vaultTokens: new Map(),
     qrPairings: new Map(),
     assists: new Map(),
+    parked: new Map(), passkeys: new Map(), primaryAttempts: new Map(), riskSeq: 0,
     // First-time linking secrets and where they were asked for: { user, secret, clientIp, userAgent, requestedAt, expiresAt, usedAt? }.
     setups: [],
   };
@@ -115,8 +148,42 @@ const REASON_TEXT = {
   passkey_required: 'The workspace requires a passkey for this action',
   number_match_requested: 'The risk check asked for number matching',
   phone_not_linked: 'No phone is linked to this account',
+  checks_incomplete: 'The risk check could not finish',
+  engine_passkey: 'The risk check asked for a passkey',
+  passkey_unavailable: 'The risk check asked for a passkey, which cannot be used here',
 };
 const reasons = (...codes) => codes.map((code) => ({ code, text: REASON_TEXT[code] }));
+// The risk-fit contract's answers: the risk level, parked correlation ids and the new refusals.
+const riskLevelOf = () => state.opts.riskLevel || (state.opts.numberMatch ? 'medium' : 'low');
+const PARENT_ID = /^[A-Za-z0-9._:-]{8,128}$/;
+const PARK_MS = 10 * 60 * 1000;
+// Like the API: a correlation id it answered is parked for the user for 10 minutes.
+function park(user) {
+  const id = `00000000-0000-4000-c000-${String(++state.riskSeq).padStart(12, '0')}`;
+  state.parked.set(id, { user, at: Date.now() });
+  return id;
+}
+// A partner's parentCorrelationId counts only when it is one parked for the same user; otherwise it is ignored.
+function parentOf(raw, user) {
+  if (typeof raw !== 'string' || !PARENT_ID.test(raw)) return null;
+  const p = state.parked.get(raw);
+  return p && p.user === user && Date.now() - p.at <= PARK_MS ? raw : null;
+}
+const RISK_UNAVAILABLE = { code: 'risk_unavailable', error: 'risk_unavailable', message: 'The risk check is unavailable; try again shortly.', retryAfter: 30, caseCode: 'REF-USE' };
+const ACTION_DENY = { code: 'blocked', reason: 'action', error: 'blocked', caseCode: 'REF-USE' };
+const PHONE_NOT_ATTESTED = { code: 'phone_not_attested', error: 'phone_not_attested', message: 'This workspace accepts only an attested phone here.' };
+const passkeyRequiredBody = (reason) => ({ code: 'passkey_required', reason, error: 'passkey_required', message: 'Approve this with a passkey; offline codes are not accepted for it.', caseCode: 'REF-USE' });
+// POST /offline/totp/verify answers its refusals as the API does: reason stays the code and
+// blockedBy names what refused it ('action' | 'risk').
+const TOTP_ACTION_DENY = { approved: false, reason: 'blocked', blockedBy: 'action', action: 'fake-deny', caseCode: 'REF-USE' };
+const totpPasskeyRequiredBody = (blockedBy) => ({ approved: false, code: 'passkey_required', reason: 'passkey_required', blockedBy, message: 'Approve this with a passkey; offline codes are not accepted for it.', caseCode: 'REF-USE' });
+const riskUnavailable = (res) => send(res, 503, RISK_UNAVAILABLE, { 'Retry-After': '30' });
+const hasPasskey = (user) => [...state.passkeys.values()].includes(user);
+// Under assurance enforce a passkey is asked only where the caller can run it (passkeyCapable) and the user has one;
+// otherwise the approval keeps number matching (passkey_unavailable).
+const passkeyAsked = (b, user) => b.passkeyCapable === true && hasPasskey(user);
+// Offline QR and code: passkeyRequired 'risk' refuses only a passkey-capable call; 'action' always.
+const offlinePasskeyRefusal = (b) => Boolean(state.opts.passkeyRequired) && (state.opts.passkeyRequired !== 'risk' || b.passkeyCapable === true);
 // Like the API: only a real second factor makes a browser known (a confirmed push that is not provisional, a passkey).
 function rememberBrowser(r) {
   if (!r.browserProof || r.status !== 'CONFIRMED' || r.provisional) return;
@@ -247,8 +314,19 @@ route('POST', '/__test/qr-decline', (req, res, b) => {
 });
 route('GET', '/__test/qr-pairings', (req, res) => send(res, 200, [...state.qrPairings.values()]));
 route('GET', '/__test/calls', (req, res) => send(res, 200, state.calls));
-// The requests so far ({ id, user, type, status, reply }): a test approves one person's by id.
-route('GET', '/__test/requests', (req, res) => send(res, 200, state.requests.map((r) => ({ id: r.id, user: r.user, type: r.type, status: r.status, reply: r.reply || null }))));
+// The requests so far ({ id, user, type, status, reply, riskLevel, deviceRiskRequestId, parentCorrelationId,
+// passkeyCapable }): a test approves one person's by id, and reads what the API took from a request.
+route('GET', '/__test/requests', (req, res) => send(res, 200, state.requests.map((r) => ({
+  id: r.id, user: r.user, type: r.type, status: r.status, reply: r.reply || null,
+  riskLevel: r.riskLevel || null, deviceRiskRequestId: r.deviceRiskRequestId ?? null, parentCorrelationId: r.parentCorrelationId || null, passkeyCapable: r.passkeyCapable === true,
+}))));
+// A passkey of `user` (credential id `cred-<user>` unless given) for passkey sign-in.
+route('POST', '/__test/passkey', (req, res, b) => {
+  if (typeof b.user !== 'string' || !b.user) return send(res, 400, { error: 'user is required' });
+  const credentialId = typeof b.credentialId === 'string' && b.credentialId ? b.credentialId : `cred-${b.user}`;
+  state.passkeys.set(credentialId, b.user);
+  send(res, 200, { credentialId });
+});
 route('POST', '/__test/recovery', (req, res, b) => {
   const c = b.id ? state.recoveries.find((x) => x.recoveryId === b.id) : state.recoveries[state.recoveries.length - 1];
   if (!c) return send(res, 404, { error: 'no recovery' });
@@ -281,6 +359,8 @@ function destinationCheck(d) {
 }
 route('POST', '/login/request', (req, res, b) => {
   const { externalUsername: user, type, referenceId = null, details } = b;
+  // Like the API: requestedBy is for Touchque's own platform only (this fake is a partner's workspace); riskPolicy is ignored.
+  if (b.requestedBy !== undefined) return send(res, 400, { code: 'requested_by_not_allowed', error: 'requestedBy is accepted only from the platform organization' });
   if (!state.linked.has(user)) return send(res, 404, { code: 'device_not_linked', error: 'No linked device found for this user' });
   // "Why?": every decision names a case code (refusals: REF-USE, pushes: K7P-2QX, checks: CHK-2QX).
   if (state.opts.frozen) return send(res, 423, { code: 'frozen', error: 'frozen', retryAfter: 900, caseCode: 'REF-USE' }, { 'Retry-After': '900' });
@@ -295,6 +375,8 @@ route('POST', '/login/request', (req, res, b) => {
     if (pairing.state !== 'confirmed') return send(res, 409, { code: 'pairing_not_confirmed', error: `The pairing is ${pairing.state}, not confirmed on the phone` });
     if (pairing.user !== user) return send(res, 409, { code: 'pairing_other_user', error: 'The pairing was scanned for another user' });
   }
+  if (state.opts.riskUnavailable) return riskUnavailable(res);
+  if (state.opts.actionDeny) return send(res, 403, ACTION_DENY);
   if (state.opts.blocked) return send(res, 403, { code: 'blocked', reason: state.opts.blocked, error: 'blocked', caseCode: 'REF-USE' });
   // Like the API: an approval given during a call and not re-confirmed yet pauses critical actions.
   if (action.critical && state.requests.some((x) => x.user === user && x.status === 'CONFIRMED' && x.provisional && !x.reconfirmedAt && !x.revokedAt)) {
@@ -303,11 +385,16 @@ route('POST', '/login/request', (req, res, b) => {
   const r = {
     id: `00000000-0000-4000-8000-${String(++state.seq).padStart(12, '0')}`, user, type, referenceId, details: toPairs(details),
     status: 'PENDING', consumed: false,
-    challengeCode: state.opts.passkeyOnly ? undefined : (state.opts.numberMatch || action.critical || b.requireNumberMatch === true ? '47' : undefined),
-    requiresPasskey: state.opts.passkeyOnly || undefined,
+    challengeCode: state.opts.passkeyOnly || (state.opts.riskPasskey && passkeyAsked(b, user)) ? undefined
+      : (state.opts.numberMatch || state.opts.riskPasskey || action.critical || b.requireNumberMatch === true ? '47' : undefined),
+    requiresPasskey: state.opts.passkeyOnly || (state.opts.riskPasskey && passkeyAsked(b, user)) || undefined,
     browserProof: b.browserProof || undefined,
     reply: b.reply && typeof b.reply === 'object' ? b.reply : undefined,
     pairing: pairing ? { id: pairing.id, keyThumbprint: pairing.keyThumbprint } : undefined,
+    riskLevel: riskLevelOf(),
+    deviceRiskRequestId: typeof b.deviceRiskRequestId === 'string' ? b.deviceRiskRequestId : undefined,
+    parentCorrelationId: parentOf(b.parentCorrelationId, user),
+    passkeyCapable: b.passkeyCapable === true,
   };
   if (pairing) {
     r.challengeCode = '47';
@@ -315,10 +402,13 @@ route('POST', '/login/request', (req, res, b) => {
   }
   r.expiresAt = new Date(Date.now() + 30000).toISOString();
   state.requests.push(r);
-  const why = [...(r.requiresPasskey ? ['passkey_required'] : []), ...(action.critical ? ['critical_action'] : []), ...(state.opts.numberMatch ? ['number_match_requested'] : [])];
+  const why = [
+    ...(r.requiresPasskey ? [state.opts.passkeyOnly ? 'passkey_required' : 'engine_passkey'] : []), ...(action.critical ? ['critical_action'] : []),
+    ...(state.opts.numberMatch ? ['number_match_requested'] : []), ...(state.opts.riskPasskey && !r.requiresPasskey ? ['passkey_unavailable'] : []),
+  ];
   send(res, 200, {
     message: 'Request sent', requestId: r.id, challengeCode: r.challengeCode, expiresAt: r.expiresAt, requiresPasskey: r.requiresPasskey,
-    caseCode: 'K7P-2QX', ...(why.length && { reasons: reasons(...why) }),
+    caseCode: 'K7P-2QX', ...(why.length && { reasons: reasons(...why) }), riskLevel: r.riskLevel,
     ...(state.opts.telemetry && { telemetryToken: 'tt_test' }),
     ...(state.opts.canary && { canary: { url: `http://127.0.0.1:${server.address().port}/c/canary-${r.id}.gif` } }),
     ...(b.destination && typeof b.destination === 'object' && { destination: destinationCheck(b.destination) }),
@@ -336,6 +426,7 @@ route('GET', '/login/status/([^/]+)', (req, res, b, m) => {
     requiresPasskey: r.requiresPasskey, confirmedVia: r.confirmedVia || null, assurance: r.status === 'CONFIRMED' ? assurance(r) : null,
     // The request's live expiry, as the API answers it (a Vishing Shield escalation extends it).
     ...(r.expiresAt && { expiresAt: r.expiresAt }),
+    ...(r.riskLevel && { riskLevel: r.riskLevel }),
     ...(r.status === 'CONFIRMED' && r.replyAnswer && { reply: r.replyAnswer }),
     ...(r.status === 'REJECTED' && r.rejectReason && { rejectReason: r.rejectReason }),
     ...(r.pairing && { pairing: r.pairing }),
@@ -435,13 +526,17 @@ route('POST', '/risk/check', (req, res, b) => {
   state.lastCheck = b;
   if (typeof b.externalUsername !== 'string' || !b.externalUsername) return send(res, 400, { code: 'invalid_request', error: 'externalUsername is required' });
   if (state.opts.rateLimited) return send(res, 429, { code: 'rate_limited', error: 'too_many_login_requests', retryAfter: 60 }, { 'Retry-After': '60' });
-  const ask = (assurance, ...codes) => send(res, 200, { prompt: true, reasons: reasons(...codes), assurance, silentMode: 'enforce', caseCode: 'CHK-2QX' });
+  // Every answer names the check (correlationId), parked for the user: the push that follows may name it as its parent.
+  const correlationId = park(b.externalUsername);
+  const ask = (assurance, ...codes) => send(res, 200, { prompt: true, reasons: reasons(...codes), assurance, silentMode: 'enforce', caseCode: 'CHK-2QX', correlationId });
   if (!state.linked.has(b.externalUsername)) return ask('normal', 'phone_not_linked');
+  // No verdict: the silent check asks, whatever the workspace's riskCheckUnavailable.
+  if (state.opts.riskUnavailable) return ask('normal', 'checks_incomplete');
   if ((state.actions.get(b.type || 'LOGIN') || {}).critical) return ask('normal', 'critical_action');
   if (state.opts.silent) {
     return send(res, 200, {
       prompt: false, reasons: reasons('known_browser', 'recent_approval', 'same_phone', 'familiar_network', 'no_risk_signal'), assurance: 'high', silentMode: 'enforce',
-      caseCode: 'CHK-2QX',
+      caseCode: 'CHK-2QX', correlationId,
     });
   }
   return ask('normal', b.browserProof ? 'new_browser' : 'no_browser_key');
@@ -453,6 +548,12 @@ route('POST', '/risk/check', (req, res, b) => {
 // report "missing", one that is not a dre_ id or has "unknown" in it is
 // "unknown", both with device_identification_missing in shadow; never an error.
 const FAKE_VISITOR = 'tqv_fakeVisitor00000001';
+// The admin's mark (opts.deviceMark) and the mark actually applied: step_up always, trusted only on a key or sid match.
+const deviceMarks = (matchedBy) => {
+  const status = state.opts.deviceMark === 'trusted' || state.opts.deviceMark === 'step_up' ? state.opts.deviceMark : 'none';
+  const mark = status === 'step_up' ? 'step_up' : status === 'trusted' && (matchedBy === 'key' || matchedBy === 'sid') ? 'trusted' : null;
+  return { status, mark };
+};
 const deviceVerdict = (flagged) => ({
   signals: flagged ? [{ code: 'device_many_accounts', text: 'Many accounts used from this one device', strength: 'number_match', enforced: false, evidence: { last24h: 4 } }] : [],
   stepUp: false, wouldStepUp: flagged, requires: 'none', mode: 'shadow',
@@ -473,7 +574,7 @@ route('POST', '/device-risk/check', (req, res, b) => {
   const flagged = (id || raw).includes('flagged');
   send(res, 200, {
     report: 'ok', requestId: id || 'dre_fakeRequest0000000000', visitorId: FAKE_VISITOR, confidence: flagged ? 0.81 : 0.99,
-    visitor: { firstSeenAt: new Date(0).toISOString(), lastSeenAt: new Date(0).toISOString(), seenCount: 2, matchedBy: flagged ? 'traits' : 'key', sealed: true, status: 'none', labels: { os: 'macOS', browser: 'Chrome', browserMajor: 130 } },
+    visitor: { firstSeenAt: new Date(0).toISOString(), lastSeenAt: new Date(0).toISOString(), seenCount: 2, matchedBy: flagged ? 'traits' : 'key', sealed: true, ...deviceMarks(flagged ? 'traits' : 'key'), labels: { os: 'macOS', browser: 'Chrome', browserMajor: 130 } },
     counts: { accounts_24h: flagged ? 4 : 1, accounts_30d: flagged ? 4 : 1, signups_24h: 0, countries_24h: 1, resets_7d: 0 },
     ...deviceVerdict(flagged), caseCode: 'DRK-2QX',
   });
@@ -485,7 +586,7 @@ route('GET', '/device-risk/events/([^/]+)', (req, res, b, m) => {
   send(res, 200, {
     requestId: id, visitorId: FAKE_VISITOR, confidence: flagged ? 0.81 : 0.99, matchedBy: flagged ? 'traits' : 'key', sealed: true, purpose: 'sign_up',
     origin: 'https://shop.example.test', country: 'TR', createdAt: new Date(0).toISOString(), usedAt: null, externalUsername: null,
-    visitor: { firstSeenAt: new Date(0).toISOString(), lastSeenAt: new Date(0).toISOString(), seenCount: 2, status: 'none', labels: { os: 'macOS', browser: 'Chrome' } },
+    visitor: { firstSeenAt: new Date(0).toISOString(), lastSeenAt: new Date(0).toISOString(), seenCount: 2, ...deviceMarks(flagged ? 'traits' : 'key'), labels: { os: 'macOS', browser: 'Chrome' } },
     facts: { codes: [], evidence: { tamper: [], vm: [], privateWindow: null }, reset: false, twins: false, privateWindow: false },
     verdict: { action: 'ALLOW', available: true, ...deviceVerdict(flagged), caseCode: null, rulesVersion: 'fake' },
   });
@@ -541,6 +642,47 @@ route('POST', '/device-risk/activity', (req, res, b) => {
   });
 });
 route('GET', '/__test/last-device-risk-activity', (req, res) => send(res, 200, state.lastDeviceRiskActivity || {}));
+// POST /device-risk/bot-check: one visitor request's address and headers, from the brand's server. As the
+// real API: ip and headers are required (headers may be an empty list: a request that sent none), as
+// [name, value] pairs or an object; 400 invalid_ip, headers_required, too_large (over 100 headers, a name
+// over 128 characters, a value over 4096) or invalid_body (wrong types). A header the visitor sent that no
+// browser sends is not an error there, nor here. The fake reads only the User-Agent, names without case:
+// "spoofed" in it is a copied Googlebot (unverified, block), Googlebot a claimed crawler (allow), an
+// "agent" in it a claimed AI agent (challenge), curl an HTTP client (challenge), none at all no_headers
+// or no_user_agent (challenge), anything else nothing (allow). Kept for the SDKs' tests (GET /__test/last-bot-check).
+const botAnswer = (bot, suggestion) => ({
+  bot: { result: 'detected', category: null, provider: null, name: null, identity: null, verifiedBy: null, confidence: 'high', rule: null, reasons: [], ...bot },
+  network: null, suggestion, rulesVersion: 'fake',
+});
+route('POST', '/device-risk/bot-check', (req, res, b) => {
+  state.lastBotCheck = b;
+  if (b.ip === undefined || b.ip === null || b.ip === '') return send(res, 400, { code: 'invalid_ip', error: 'ip is required: the visitor\'s IPv4 or IPv6 address.' });
+  if (typeof b.ip !== 'string' || !net.isIP(b.ip.trim().replace(/^\[(.*)\]$/, '$1').replace(/^::ffff:(?=\d+\.)/i, ''))) return send(res, 400, { code: 'invalid_ip', error: 'ip must be an IPv4 or IPv6 address.' });
+  if (b.headers === undefined || b.headers === null || typeof b.headers !== 'object') return send(res, 400, { code: 'headers_required', error: 'headers is required: the visitor request\'s headers as [name, value] pairs, or an empty list when it sent none.' });
+  const pairs = Array.isArray(b.headers) ? b.headers : Object.entries(b.headers);
+  if (pairs.length > 100) return send(res, 400, { code: 'too_large', error: 'At most 100 headers.' });
+  for (const p of pairs) {
+    const values = Array.isArray(p) && !Array.isArray(b.headers) && Array.isArray(p[1]) ? p[1] : [Array.isArray(p) ? p[1] : undefined];
+    if (!Array.isArray(p) || p.length !== 2 || typeof p[0] !== 'string' || values.some((v) => typeof v !== 'string' && typeof v !== 'number')) return send(res, 400, { code: 'invalid_body', error: 'Each header must be a [name, value] pair of strings.' });
+    if (p[0].length > 128 || values.some((v) => String(v).length > 4096)) return send(res, 400, { code: 'too_large', error: 'A header name may have at most 128 characters, a value 4096.' });
+  }
+  for (const k of ['method', 'url']) if (b[k] !== undefined && b[k] !== null && typeof b[k] !== 'string') return send(res, 400, { code: 'invalid_body', error: `${k} must be a string.` });
+  if (b.tls !== undefined && b.tls !== null && (typeof b.tls !== 'object' || Array.isArray(b.tls))) return send(res, 400, { code: 'invalid_body', error: 'tls must be an object: { ciphers?, ja4? }.' });
+  if (b.truncated !== undefined && b.truncated !== null && typeof b.truncated !== 'boolean') return send(res, 400, { code: 'invalid_body', error: 'truncated must be true or false.' });
+  const uaPair = pairs.find((p) => p[0].toLowerCase() === 'user-agent');
+  const ua = uaPair ? String(Array.isArray(uaPair[1]) ? uaPair[1][0] : uaPair[1]) : '';
+  const claim = (name) => ({ result: 'detected', reasons: [{ code: 'directory.ua_claim', text: `Its user agent says it is ${name}.` }] });
+  if (/spoofed/i.test(ua) && /googlebot/i.test(ua)) {
+    return send(res, 200, botAnswer({ ...claim('Googlebot (Google)'), category: 'search_crawler', provider: 'Google', name: 'Googlebot', identity: 'unverified', verifiedBy: 'reverse_dns', rule: 'directory.googlebot' }, 'block'));
+  }
+  if (/googlebot/i.test(ua)) return send(res, 200, botAnswer({ ...claim('Googlebot (Google)'), category: 'search_crawler', provider: 'Google', name: 'Googlebot', identity: 'claimed', confidence: 'medium', rule: 'directory.googlebot' }, 'allow'));
+  if (/\bagent\b/i.test(ua)) return send(res, 200, botAnswer({ category: 'ai_agent', provider: 'agent.example.com', name: 'agent.example.com', identity: 'claimed', confidence: 'medium', rule: 'web_bot_auth.unchecked' }, 'challenge'));
+  if (/^curl\//i.test(ua)) return send(res, 200, botAnswer({ category: 'http_client', name: 'curl', rule: 'http_client.curl', reasons: [{ code: 'http_client.curl', text: 'Its user agent is curl, a programming library or command-line tool, not a browser.' }] }, 'challenge'));
+  if (!pairs.length) return send(res, 200, botAnswer({ category: 'http_client', rule: 'http_client.no_headers', reasons: [{ code: 'http_client.no_headers', text: 'It sent no headers at all, not even a User-Agent: every browser sends one, with a dozen more.' }] }, 'challenge'));
+  if (!ua) return send(res, 200, botAnswer({ category: 'http_client', confidence: 'medium', rule: 'http_client.no_user_agent', reasons: [{ code: 'http_client.no_user_agent', text: 'It sends no User-Agent: every browser sends one.' }] }, 'challenge'));
+  send(res, 200, botAnswer({ result: 'not_detected', confidence: null }, 'allow'));
+});
+route('GET', '/__test/last-bot-check', (req, res) => send(res, 200, state.lastBotCheck || {}));
 const browserView = ({ user, ...rest }) => rest;
 route('GET', '/risk/browsers', (req, res) => {
   const user = new URL(req.url, 'http://x').searchParams.get('externalUsername');
@@ -579,6 +721,8 @@ route('POST', '/recovery/start', (req, res, b) => {
   const user = b.externalUsername;
   if (typeof user !== 'string' || !user) return send(res, 400, { code: 'invalid_request', error: 'externalUsername is required' });
   if (!state.linked.has(user)) return send(res, 404, { code: 'device_not_linked', error: 'This user has no linked phone' });
+  if (state.opts.riskUnavailable) return riskUnavailable(res);
+  if (state.opts.actionDeny) return send(res, 403, ACTION_DENY);
   if (state.opts.blocked) return send(res, 403, { code: 'blocked', reason: 'risk', error: 'blocked' });
   const open = state.recoveries.find((c) => c.externalUsername === user && RECOVERY_OPEN.includes(c.status) && c.status !== 'AWAITING_DEVICE');
   if (open) return send(res, 409, { code: 'recovery_in_progress', recoveryId: open.recoveryId, error: 'A recovery for this user is already running.' });
@@ -596,7 +740,7 @@ route('POST', '/recovery/start', (req, res, b) => {
     completedAt: null, endedReason: null, endedBy: null, createdAt: new Date().toISOString(), receipts: [],
   };
   state.recoveries.push(c);
-  send(res, 201, { ...c, bindCode, bindUri: `touchque://recover?id=${id}&code=${bindCode}`, riskContext: { level: 'none', reasons: [] } });
+  send(res, 201, { ...c, bindCode, bindUri: `touchque://recover?id=${id}&code=${bindCode}`, riskContext: { level: 'none', reasons: [] }, caseCode: 'RCV-2QX', riskLevel: riskLevelOf() });
 });
 route('GET', '/recovery', (req, res) => {
   const q = new URL(req.url, 'http://x').searchParams;
@@ -951,13 +1095,25 @@ route('POST', '/offline/challenge', (req, res, b) => {
   if (b.requestId && !linked) return send(res, 404, { error: 'request_not_found' });
   if (linked && linked.status === 'REJECTED') return send(res, 409, { error: 'request_rejected' });
   if (linked && linked.requiresPasskey) return send(res, 403, { error: 'passkey_required', reason: 'passkey_required' });
+  // The QR is a sign-in like a push (the risk-fit contract): the workspace's refusals come first.
+  if (state.opts.phoneNotAttested) return send(res, 403, PHONE_NOT_ATTESTED);
+  if (state.opts.riskUnavailable) return riskUnavailable(res);
+  if (state.opts.actionDeny) return send(res, 403, ACTION_DENY);
+  if (offlinePasskeyRefusal(b)) return send(res, 403, passkeyRequiredBody(state.opts.passkeyRequired));
   const id = `ch-${++state.seq}`;
   state.challenges.set(id, { user: b.externalUsername, type: b.type, used: false, requestId: linked && linked.id });
-  const challengeCode = (linked && linked.challengeCode) || (b.requireNumberMatch === true ? '47' : undefined);
+  // A passkey the call cannot run (no passkeyCapable): the QR keeps a number instead.
+  const passkeyUnavailable = state.opts.passkeyRequired === 'risk';
+  const challengeCode = (linked && linked.challengeCode) || (b.requireNumberMatch === true || passkeyUnavailable ? '47' : undefined);
+  const why = [
+    ...((state.actions.get(b.type) || {}).critical ? ['critical_action'] : []), ...(state.opts.numberMatch ? ['number_match_requested'] : []),
+    ...(passkeyUnavailable ? ['passkey_unavailable'] : []),
+  ];
   send(res, 200, {
     challengeId: id, qr: qrFormat === 'compact' ? 'TQ3:X' : 'TQ2.x', qrFormat, qrDataUrl: 'data:image/png;base64,OFFLINE',
     ...(b.includeQrTerminal === true ? { qrTerminal: '█▀▀▀█\n█ ▄ █\n▀▀▀▀▀' } : {}),
     expiresAt: 'soon', expiresInSeconds: 120, totpAvailable: true, ...(challengeCode ? { challengeCode } : {}),
+    caseCode: 'QRC-2QX', ...(challengeCode && why.length ? { reasons: reasons(...why) } : {}), riskLevel: riskLevelOf(),
   });
 });
 route('POST', '/offline/verify', (req, res, b) => {
@@ -985,6 +1141,7 @@ const deviceUserOf = (raw) => (typeof raw === 'string' && raw && raw.length <= 2
 const deviceText = (raw, max) => { const t = typeof raw === 'string' ? raw.trim() : ''; return t && t.length <= max ? t : null; };
 route('POST', '/offline/device-packs', (req, res, b) => {
   if (state.opts.devicePacksDisabled) return send(res, 403, { error: 'offline_device_packs_disabled' });
+  if (state.opts.phoneNotAttested) return send(res, 403, PHONE_NOT_ATTESTED);
   const user = deviceUserOf(b.externalUsername);
   const scopeId = deviceScopeOf(b.scope && b.scope.id);
   const name = deviceText(b.scope && b.scope.name, 80);
@@ -1049,8 +1206,13 @@ route('POST', '/offline/device-packs/report', (req, res, b) => {
 route('POST', '/offline/totp/verify', (req, res, b) => {
   if (b.requestId && (state.requests.find((x) => x.id === b.requestId) || {}).status === 'REJECTED') return send(res, 410, { approved: false, reason: 'request_rejected' });
   if (b.requestId && (state.requests.find((x) => x.id === b.requestId) || {}).requiresPasskey) return send(res, 403, { approved: false, reason: 'passkey_required' });
+  if (state.opts.phoneNotAttested) return send(res, 403, { approved: false, ...PHONE_NOT_ATTESTED });
   if (b.code !== '123456') return send(res, 401, { approved: false, reason: 'invalid_code' });
-  send(res, 200, { approved: true, externalUsername: b.externalUsername });
+  // A right code is still a sign-in: the workspace's refusals and the risk check decide first.
+  if (state.opts.riskUnavailable) return riskUnavailable(res);
+  if (state.opts.actionDeny) return send(res, 403, TOTP_ACTION_DENY);
+  if (offlinePasskeyRefusal(b)) return send(res, 403, totpPasskeyRequiredBody(state.opts.passkeyRequired));
+  send(res, 200, { approved: true, externalUsername: b.externalUsername, caseCode: 'TTP-2QX', riskLevel: riskLevelOf() });
 });
 // Outage verifiers: every linked user's outage code is K7P2QXA at every step, one digest a step,
 // hashed like the API (a cheaper KDF). The scope is required, as in the API.
@@ -1089,6 +1251,41 @@ route('POST', '/webauthn/register/options', (req, res, b) => {
 });
 // A workspace with passkey sign-in on (TenantPolicy.passwordlessLoginEnabled).
 route('GET', '/webauthn/authenticate/primary/availability', (req, res) => send(res, 200, { enabled: true, userVerification: 'preferred' }));
+// Passkey sign-in, like the API without the ceremony: an attempt is used once, the passkey
+// (`response.id`) must be one of /__test/passkey's, for the attempt's user when it names one. The
+// risk check passes it (a CONFIRMED request) or asks for a step-up (opts passkeyStepUp), whose
+// correlationId is parked for the user like a risk check's.
+route('POST', '/webauthn/authenticate/primary/options', (req, res, b) => {
+  const user = typeof b.externalUsername === 'string' && b.externalUsername ? b.externalUsername : null;
+  const attemptId = `00000000-0000-4000-d000-${String(++state.riskSeq).padStart(12, '0')}`;
+  state.primaryAttempts.set(attemptId, user);
+  send(res, 200, { attemptId, options: { challenge: `primary-${attemptId}`, rpId: 'example.com', allowCredentials: [], userVerification: 'preferred' } });
+});
+route('POST', '/webauthn/authenticate/primary/verify', (req, res, b) => {
+  if (!b.attemptId || !b.response) return send(res, 400, { error: 'attemptId and response are required' });
+  if (!state.primaryAttempts.has(b.attemptId)) return send(res, 400, { error: 'Login session not found or expired. Please restart.' });
+  const wanted = state.primaryAttempts.get(b.attemptId);
+  state.primaryAttempts.delete(b.attemptId);
+  const user = state.passkeys.get(String(b.response.id));
+  if (!user || (wanted && user !== wanted)) return send(res, 404, { error: 'This credential is not registered for this user' });
+  if (state.opts.riskUnavailable) return riskUnavailable(res);
+  if (state.opts.actionDeny) return send(res, 403, ACTION_DENY);
+  if (state.opts.passkeyStepUp) {
+    return send(res, 200, {
+      success: false, requiresStepUp: true, externalUsername: user, riskScore: 0.5, riskLevel: state.opts.riskLevel || 'medium',
+      correlationId: park(user), caseCode: 'PKY-2QX', reasons: reasons('number_match_requested'),
+    });
+  }
+  const r = {
+    id: `00000000-0000-4000-8000-${String(++state.seq).padStart(12, '0')}`, user, type: 'LOGIN', referenceId: null, details: null,
+    status: 'CONFIRMED', consumed: false, confirmedVia: 'WEBAUTHN_PRIMARY', riskLevel: riskLevelOf(),
+  };
+  state.requests.push(r);
+  send(res, 200, {
+    success: true, requestId: r.id, externalUsername: user, riskScore: 0, riskLevel: r.riskLevel, caseCode: 'PKY-2QX',
+    userVerified: true, credentialDeviceType: 'multiDevice', credentialBackedUp: true,
+  });
+});
 route('GET', '/webauthn/credentials', (req, res) => send(res, 200, { credentials: [] }));
 // Like the API since 3.3.0: the user the passkey belongs to is required.
 route('DELETE', '/webauthn/credentials/([^/]+)', (req, res) => (new URL(req.url, 'http://x').searchParams.get('externalUsername')

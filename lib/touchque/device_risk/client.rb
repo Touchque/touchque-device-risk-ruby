@@ -36,8 +36,13 @@ module Touchque
       EVENTS = %w[sign_in sign_up password_reset approval].freeze
       # What the page had sent: ok, replayed, or no usable identification.
       REPORTS = %w[ok replayed missing unknown expired invalid].freeze
+      # The marks a visitor's "mark" can hold (nil: none applied).
+      MARKS = %w[trusted step_up].freeze
       # How a visitor was recognised (an event's "matchedBy").
       MATCHED_BY = %w[key fpc sid traits new].freeze
+      # The kind of network an answer's network["kind"] names (search_events' network_kind:). An open
+      # list: new values may be added in minor versions, so an answer can carry one not listed here.
+      NETWORK_KINDS = %w[residential mobile_carrier education business public_wifi hosting proxy vpn tor relay unknown].freeze
       # What your server saw the visitor do (activity's type:).
       ACTIVITY_TYPES = %w[payment_attempt login_failed not_found forbidden otp_sent code_failed].freeze
       # payment_attempt: what the payment provider answered.
@@ -48,7 +53,7 @@ module Touchque
       PATH_CLASSES = %w[admin wordpress secrets source db_admin debug shell other].freeze
       REQUEST_ID = /\Adre_[A-Za-z0-9_-]{22}\z/
       SEARCH_FILTERS = { from: "from", to: "to", signal: "signal", kind: "kind", origin: "origin", ip: "ip", account: "account",
-                         visitor_id: "visitorId", request_id: "requestId", cursor: "cursor" }.freeze
+                         visitor_id: "visitorId", request_id: "requestId", network_kind: "networkKind", cursor: "cursor" }.freeze
       CARD_NUMBER = "never send the card number: card: is { bin: 6 to 8 digits, last4: 4 digits }"
 
       # Anything left nil falls back to the environment: TQ_API_KEY, TQ_API_SECRET and
@@ -99,9 +104,13 @@ module Touchque
       # or a CIDR range and is never returned. Pass "nextCursor" back as cursor: until it is
       # nil; do not page by moving the dates. A search that would read too much is a 422
       # search_too_broad: narrow the range or add a filter. Each event may carry "suspect"
-      # (see parse_suspect) and "matchedBy" (MATCHED_BY).
+      # (see parse_suspect), "matchedBy" (MATCHED_BY) and "network" (as in parse_check).
+      # network_kind: is a network["kind"] (NETWORK_KINDS, sent as networkKind): it matches only
+      # identifications classified since network kind exists, never older ones. shared: true keeps
+      # the identifications whose own address was shared, false the ones counted and not shared: one
+      # that was not counted matches neither. Older servers ignore both and answer as without them.
       # { "events" => [...], "nextCursor" => String | nil, "from" => String, "to" => String }.
-      def search_events(step_up: nil, limit: nil, **filters)
+      def search_events(step_up: nil, shared: nil, limit: nil, **filters)
         unknown = filters.keys - SEARCH_FILTERS.keys
         raise ConfigError, "search_events() does not know #{unknown.join(', ')}" unless unknown.empty?
         raise ConfigError, "search_events() limit must be 1 to 100" unless limit.nil? || (limit.is_a?(Integer) && limit.between?(1, 100))
@@ -109,6 +118,7 @@ module Touchque
         params = {}
         filters.each { |k, v| params[SEARCH_FILTERS[k]] = v if v.is_a?(String) && !v.empty? }
         params["stepUp"] = step_up ? "true" : "false" if [true, false].include?(step_up)
+        params["shared"] = shared ? "true" : "false" if [true, false].include?(shared)
         params["limit"] = limit.to_s if limit
         raw = @http.get("/device-risk/events", params) || {}
         cursor = raw["nextCursor"]
@@ -118,8 +128,9 @@ module Touchque
       end
 
       # The trusted identification behind a request_id: the visitor, how sure, what the page
-      # showed, the risk engine's verdict, "accountDevice" and "suspect" (read them with
-      # parse_account_device / parse_suspect). Read-only.
+      # showed, the risk engine's verdict, "network" and "bot" (as in parse_check), "accountDevice"
+      # and "suspect" (read them with parse_account_device / parse_suspect). Read-only.
+      # visitor["mark"] is the mark actually applied (see parse_check).
       def get_event(request_id)
         raise ConfigError, "get_event() needs a request_id (dre_...)" unless request_id.is_a?(String) && REQUEST_ID.match?(request_id)
 
@@ -205,6 +216,68 @@ module Touchque
         out
       end
 
+      # Asks which bot sent one request your server received (POST /device-risk/bot-check). Many
+      # bots never run your page's JavaScript, so the page tag never sees them: ChatGPT-User,
+      # GPTBot, Meta's crawlers, Grok's fetches, curl and scripts. Your server sends the visitor's
+      # address and headers; Touchque answers which bot it is, whether that identity is proven and
+      # what it would do. Touchque never logs or stores header values and keeps nothing from a
+      # check but short-lived keyed-hash counters. In a Rack app (Rails, Sinatra) use
+      # bot_check_rack(request.env).
+      #
+      #   r = dr.bot_check(ip: visitor_ip, headers: [["Host", "shop.example"], ["User-Agent", ua], ["Accept", "*/*"]],
+      #                    method: "GET", url: "https://shop.example/login", http_version: "1.1")
+      #   r.bot.result     # "detected", "suspected" or "not_detected"
+      #   r.bot.identity   # "verified", "unverified" (a spoofed name) or "claimed"
+      #   r.suggestion     # "allow", "block" or "challenge": advice in shadow, Touchque never enforces it
+      #
+      # ip: is the visitor's IPv4 or IPv6 address as your server saw it. headers: is
+      # [[name, value], ...] in the order received (the order is a sign too; [] for a request that had
+      # none), or { name => value } when the order is unknown. Authorization, Cookie,
+      # Proxy-Authorization, X-Api-Key and Set-Cookie go with empty values, their names kept for the
+      # order. What the visitor sent never raises: the first 100 headers go, a name is cut to 128
+      # characters and a value to 4096, the request is kept under 32 KB, and "truncated" => true tells
+      # Touchque so; a header HTTP does not allow, a method other than 1 to 16 letters or a URL
+      # Touchque could not read is left out. No ip (or not one address) or a wrong shape raises
+      # ConfigError before anything is sent. url: goes without its query string (only the host and
+      # path are read). http_version: ("1.0", "1.1", "2" or "3") and tls: ({ ciphers:, ja4: }) only
+      # when your edge tells you what the visitor's were, never your server's own protocol. Answers a
+      # BotCheck::Result. 400 (APIError code invalid_ip, headers_required, too_large, invalid_body),
+      # 409 device_risk_off until your workspace turns Device risk on, 429 (retry_after) past your
+      # workspace's bot checks per minute.
+      def bot_check(ip:, headers:, method: nil, url: nil, http_version: nil, tls: nil)
+        body = BotCheck.request_body(ip: ip, headers: headers, method: method, url: url, http_version: http_version, tls: tls)
+        self.class.parse_bot_check(@http.post("/device-risk/bot-check", body))
+      end
+
+      # bot_check for the request a Rack app (Rails, Sinatra, Roda, Hanami) is answering: pass its
+      # env (request.env; a request object that answers #env works too). It sends the visitor's
+      # address (Rails' request.remote_ip, else Rack's request.ip, else REMOTE_ADDR: set your trusted
+      # proxies), the headers in the order the server kept them (in lower case: Rack keeps no case),
+      # the method and the host and path. It never sends the env's own HTTP version: that is the
+      # connection to this server, behind a proxy the proxy's. ip: replaces the env's address;
+      # http_version: and tls: are what your edge saw, as for bot_check.
+      #
+      # Like bot_check, it never raises for what the visitor sent.
+      #
+      #   r = dr.bot_check_rack(request.env)   # in a Rails controller
+      #   head :forbidden if r.suggestion == "block"   # a spoofed bot name; your choice to act on it
+      def bot_check_rack(env, ip: nil, http_version: nil, tls: nil)
+        env = env.env if !env.is_a?(Hash) && env.respond_to?(:env)
+        raise ConfigError, "bot_check_rack(): pass the Rack env (request.env)" unless env.is_a?(Hash)
+
+        req = BotCheck.rack_request(env)
+        body = BotCheck.request_body(ip: ip || req[:ip], headers: req[:headers], method: req[:method], url: req[:url],
+                                     http_version: http_version, tls: tls, where: "bot_check_rack()")
+        self.class.parse_bot_check(@http.post("/device-risk/bot-check", body))
+      end
+
+      # Reads a bot check answer (the decoded JSON) into a BotCheck::Result. Never raises: fields
+      # and values added later come through as they are, a missing or broken one reads as nothing
+      # seen (result "not_detected", suggestion "allow").
+      def self.parse_bot_check(raw)
+        BotCheck::Result.parse(raw)
+      end
+
       # The suspect score of an answer, event or search row (in shadow: it decides nothing
       # yet), or nil: "score" 0-100, "band" (low | medium | high | critical), "wouldDo"
       # (allow | number_match | passkey | block: what it would ask for), "mode" ("shadow")
@@ -243,8 +316,19 @@ module Touchque
         out
       end
 
+      # The visitor as it came; a "mark" other than trusted or step_up reads as nil (no mark applied).
+      def self.visitor_of(raw)
+        return nil unless raw.is_a?(Hash)
+        return raw unless raw.key?("mark")
+
+        raw.merge("mark" => MARKS.include?(raw["mark"]) ? raw["mark"] : nil)
+      end
+
       # Reads an answer, failing toward asking: "stepUp" is true unless it says exactly
-      # false; junk signals are dropped.
+      # false; junk signals are dropped. visitor["mark"] is the mark actually applied to the
+      # identification: "step_up" always, "trusted" only when the browser matched by its stored
+      # key or id (never by traits), else nil; visitor["status"] stays your admin's mark. Absent
+      # from older servers.
       def self.parse_check(raw)
         body = raw.is_a?(Hash) ? raw : {}
         signals = (body["signals"].is_a?(Array) ? body["signals"] : []).filter_map do |s|
@@ -261,21 +345,37 @@ module Touchque
           "requestId" => body["requestId"].is_a?(String) ? body["requestId"] : nil,
           "visitorId" => body["visitorId"].is_a?(String) ? body["visitorId"] : nil,
           "confidence" => body["confidence"].is_a?(Numeric) ? body["confidence"] : nil,
-          "visitor" => body["visitor"].is_a?(Hash) ? body["visitor"] : nil,
+          "visitor" => visitor_of(body["visitor"]),
           "counts" => body["counts"].is_a?(Hash) ? body["counts"] : nil,
-          # The address (never coordinates), the visitor's counts, one answer to "a bot?" (detected | suspected | not_detected).
+          # "network" is the address as the risk engine saw it (never coordinates), passed through as the API answers
+          # it: countryCode, region, city, accuracyKm, timeZone, asn, asnOrg, type (isp | hosting | tor | relay: Apple's
+          # iCloud Private Relay | unknown), tor, hosting, hostingProvider, proxy (on a public proxy list in the last 30
+          # days: context; absent on older servers; the proxy list includes IP2Proxy LITE data available from
+          # https://lite.ip2location.com), timezoneMismatch and, absent on older servers (nil when not classified, as
+          # for an identification made before them): kind (NETWORK_KINDS, an open list: new values may be added in minor
+          # versions), kindSource (address | network | mixed | network_open | name, the operator's name only: shown,
+          # never used for a decision), vpn (a VPN company's own address), shared (many browsers used this address on
+          # your pages in the last 24 hours: context only), sharedVisitors24h and sharedAccounts24h (at least 1, 2, 5,
+          # 10, 100 or 1000; nil when not counted) and lookAlikeMatching (false: this computer was recognised only by
+          # its own key, cookie or stored id; true: look-alike matching was allowed; nil: not decided). The shared
+          # fields describe the identification's own address: nil when the answer is about another one.
           "network" => body["network"].is_a?(Hash) ? body["network"] : nil,
           "velocity" => body["velocity"].is_a?(Hash) ? body["velocity"] : nil,
           # "bot" is passed through as the API answers it: result (detected | suspected | not_detected), reasons
-          # (detected ones first, then suspected: webdriver, headless, pointer_synthetic, zero_window, soft_gpu,
-          # tool_<name>, agent_verified, input_synthetic, agent_pace, cdp, agent_unverified, agent_claimed) and,
-          # on servers since 2026-11-24 (absent on older ones): type (ai_agent: an AI agent or bot by its own
-          # identity, or a pause before every step; automation: a driven browser; script: moved or typed like
-          # software in a browser that shows no driver; or null), tools (automation tools whose marks were on
-          # the page: selenium, playwright, puppeteer, phantomjs, nightmare, headless_chrome), agent (null, or
-          # provider, name, category ai_agent | ai_crawler | search_crawler, identity verified | unverified |
-          # claimed: a Web Bot Auth signature checked against the provider's published keys, or the user agent
-          # only) and input (insert_no_keys, uniform_keys, instant_keys, center_press, agent_pace).
+          # (detected ones first: webdriver, headless, tool_<name>, agent_verified; then suspected: pointer_synthetic,
+          # input_synthetic, agent_pace, zero_window, headless_window, emulator, cdp, cdp_input (a press with no
+          # pressure: only the DevTools protocol sends it), input_no_focus (a click or key into a page that was not in
+          # front), insert_text_bulk (text that arrived whole, no key pressed), scripted_click (a form sent with no
+          # click or key), agent_unverified, agent_claimed; soft_gpu (software graphics) only next to another) and, on
+          # servers since 2026-11-24 (absent on older ones): type (ai_agent: an AI agent or bot by its own identity or
+          # its marks on the page, or a pause before every step; automation: a driven browser; script: moved or typed
+          # like software in a browser that shows no driver; or null), tools (the automation tools and AI agents whose
+          # marks were on the page: selenium, playwright, puppeteer, phantomjs, nightmare, headless_chrome and, on
+          # servers since 2026-11-25, claude_agent (the Claude app's browser or Claude in Chrome), comet_agent
+          # (Perplexity Comet), genspark_agent, browser_use, stagehand, skyvern), agent (null, or provider, name,
+          # category ai_agent | ai_crawler | search_crawler, identity verified | unverified | claimed: a Web Bot Auth
+          # signature checked against the provider's published keys, or the user agent only) and input
+          # (insert_no_keys, uniform_keys, instant_keys, center_press, agent_pace). New tools and reasons may be added.
           "bot" => body["bot"].is_a?(Hash) ? body["bot"] : nil,
           # Did this account use the device before (nil before an account is named); see parse_account_device.
           "accountDevice" => parse_account_device(body["accountDevice"]),

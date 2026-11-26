@@ -4,12 +4,13 @@ require_relative "device_risk/version"
 require_relative "device_risk/errors"
 require_relative "device_risk/util"
 require_relative "device_risk/http"
+require_relative "device_risk/bot_check"
 require_relative "device_risk/client"
 
 module Touchque
   # Touchque Device Risk: a visitor ID for every browser on your sign-up, password-reset,
-  # sign-in or approval page, a risk verdict for the account it is used for, and the
-  # abuse your server sees.
+  # sign-in or approval page, a risk verdict for the account it is used for, the abuse your
+  # server sees, and which bot sent a request your server received (bot_check).
   #
   #   # TQ_API_KEY=tq_...  TQ_API_SECRET=...
   #   dr = Touchque::DeviceRisk::Client.new
